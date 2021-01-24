@@ -1,0 +1,456 @@
+#!/bin/sh
+# vim:ts=4:sw=4:expandtab
+
+# Copyright (c) 1999-2016 Parallels International GmbH
+# All Rights Reserved
+#
+# http://www.parallels.com
+#
+# This script is a part of Parallels Tools for Linux
+#
+#
+# This script check and fixes broken xorg.conf
+# Following issues can be handled:
+# * missing Parallels mouse section
+# * missing or unset AllowEmptyInput section
+# * missing SendCoreEvents option (SCE) of non-parallels mouse
+# * unneeded 'CorePointer' option (CP) for non-parallels mouse
+
+
+
+
+# Exit codes
+EXIT_OK=0
+EXIT_ERR_MISSING_MOUSE=2
+EXIT_ERR_MISSING_ALLOWEMPTYINPUT=3
+EXIT_ERR_ALLOWEMPTYINPUT_FOUND=4
+EXIT_ERR_MISSING_SCE=5
+EXIT_ERR_UNNEEDED_CP=6
+EXIT_ERR_CANNOT_FIX_MOUSE=12
+EXIT_ERR_CANNOT_FIX_ALLOWEMPTYINPUT=13
+EXIT_ERR_CANNOT_FIX_SCE=14
+EXIT_ERR_CANNOT_FIX_CP=15
+
+
+# Check if Parallels Mouse section is present.
+# $1 - file to check
+# Returns 0 if section found, else 1
+pxcf_check_prl_mouse () {	
+    grep -iqs '^[[:space:]]*Driver[[:space:]]\+"prlmouse"' "${1}"
+}
+
+
+
+# Check if option `AllowEmptyInput'/'AutoAddDevices' exists
+# $1 - file to check
+pxcf_check_allowemptyinput_exists_any () {
+    cmd_l='^[[:space:]]*Option[[:space:]]\+'
+    cmd_r='[[:space:]]\+"\?"\?'
+    grep -iqs "$cmd_l\"AllowEmptyInput\"$cmd_r" "${1}" ||
+    grep -iqs "$cmd_l\"AutoAddDevices\"$cmd_r" "${1}"
+    return $?
+}
+pxcf_check_allowemptyinput_exists_both_yes () {
+    cmd_l='^[[:space:]]*Option[[:space:]]\+'
+    cmd_r='[[:space:]]\+"\?\(yes\|on\|1\|true\)"\?'
+    grep -iqs "$cmd_l\"AllowEmptyInput\"$cmd_r" "${1}" &&
+    grep -iqs "$cmd_l\"AutoAddDevices\"$cmd_r" "${1}"
+    return $?
+}
+
+# Check if option 'SendCoreEvents' is set to positive value for non-parallels mouse
+# $1 - file to check
+pxcf_check_mouse_sce_yes() {
+
+    awk '
+    BEGIN {
+        in_inputdevice_section = 0
+        non_prlmouse_section = 0
+        sce_option_yes = 0
+    }
+    {
+        input_line = tolower($0)
+        if (input_line ~ /^[\t ]*section[\t ]+"inputdevice"/)
+            in_inputdevice_section = 1
+        if (in_inputdevice_section == 1 && input_line ~ /^[\t ]*driver[\t ]+"mouse"/)
+            non_prlmouse_section = 1
+        if (in_inputdevice_section == 1 && input_line ~ /^[\t ]*option[\t ]+"sendcoreevents"[\t ]+"(yes|1|true|on)"/)
+            sce_option_yes = 1
+        if (in_inputdevice_section == 1 && input_line ~ /^[\t ]*endsection/)
+        {
+            if (non_prlmouse_section == 1 && sce_option_yes == 0)
+                print "sce_no"
+            in_inputdevice_section = 0
+            sce_option_no = 0
+            non_prlmouse_section = 0
+        }   
+    }
+    ' "$1" | grep -q 'sce_no' && return 1
+
+    return 0
+}
+
+
+# Check if some input devices have unneeded "CorePointer" option (except "Parallels Mouse")
+# For now the logic is that only "Parallels Mouse" should have such option
+# $1 - file to check
+pxcf_check_unneeded_cp() {
+
+    ! grep -ivs '^[[:space:]]*InputDevice[[:space:]]\+"Parallels Mouse"[[:space:]]\+"CorePointer"' "${1}" | \
+        grep -iqs '^[[:space:]]*InputDevice[[:space:]]\+"[[:alnum:]_ ]\+"[[:space:]]\+"CorePointer"'
+}
+
+
+# Added option 'SendCoreEvents' to positive value for all non-parallels mouses
+# $1 - source file
+# $2 - target file
+pxcf_add_mouse_sce_yes() {
+
+    awk '
+    BEGIN {
+        idx = 0
+        in_inputdevice_section = 0
+        add_sce = 1
+    }
+    {
+        input_line = tolower($0)
+        if (input_line ~ /^[\t ]*section[\t ]+"inputdevice"/)
+            in_inputdevice_section = 1
+        if (in_inputdevice_section == 1)
+        {
+            if (input_line !~ /^[\t ]*option[\t ]+"sendcoreevents"[\t ]+"(no|0|false|off)"/)
+            {
+                items[idx] = $0
+                ++idx
+                if (input_line ~ /^[\t ]*option[\t ]+"sendcoreevents"[\t ]+"(yes|1|true|on)"/)
+                    add_sce = 0
+                # Dont need SCE option for all input devices with driver different to "mouse"
+                if (input_line ~ /^[\t ]*driver[\t ]+"[A-Za-z0-9_]+"/ && tolower($2) !~ /"mouse"/)
+                    add_sce = 0
+            }
+        }
+        else
+            print $0
+
+        if (in_inputdevice_section == 1 && input_line ~ /^[\t ]*endsection/)
+        {
+            # Print out InputDevice section
+            for (i = 0; i < idx - 1; ++i)
+                print items[i]
+            # Add SCE option if needed
+            if (add_sce == 1)
+                printf "\tOption\t\"SendCoreEvents\"\t\"yes\"\n"
+            # And print out the last EndSection line
+            print items[idx - 1]
+            idx = 0
+            in_inputdevice_section = 0
+            add_sce = 1
+        }
+        
+    }' "${1}" > "${2}"
+}
+
+
+# Delete 'CorePointer' option from all input devices except 'Parallels Mouse'
+# $1 - source file
+# $2 - target file
+pxcf_del_unneeded_cp() {
+
+    awk '
+    {
+        if (tolower($0) ~ /^[\t ]*inputdevice[\t ]+"parallels mouse"/)
+            print;
+        else if (tolower($0) ~ /^[\t ]*inputdevice[\t ]+"[a-z0-9_ ]+"[\t ]+"corepointer"/)
+        {
+            s = $0
+            sub("[\t ]+\"[Cc][Oo][Rr][Ee][Pp][Oo][Ii][Nn][Tt][Ee][Rr]\"", "", s)
+            print s;
+        }
+        else
+            print;
+    }' "${1}" > "${2}"
+}
+
+
+# Delete option `AllowEmptyInput'/'AutoAddDevices' at all
+# $1 - file to modify
+pxcf_del_allowemptyinput () {
+    cmd_l='/^[[:space:]]*Option[[:space:]]\+'
+    cmd_r='[[:space:]]\+"\?"\?/d'
+    sed -i "$cmd_l\"AllowEmptyInput\"$cmd_r" "${1}"
+    sed -i "$cmd_l\"AutoAddDevices\"$cmd_r" "${1}"
+}
+
+# Add Parallels Mouse section to xorg.conf
+# $1 - source file 
+# $2 - target file
+pxcf_add_prl_mouse () {
+    status=0
+
+    # Activate Parallels Mouse in default server layout
+    awk '
+        {
+                print;
+                if ($0 ~ /^[\t ]*Section[\t ]+"ServerLayout"/)
+                        print "\tInputDevice\t\"Parallels Mouse\"\t\"CorePointer\""
+        }' "${1}" > "${2}"
+
+    # Add section to xorg.conf
+    cat >> "${2}" << EOF
+
+# Parallels Mouse
+Section "InputDevice"
+    Identifier     "Parallels Mouse"
+    Driver         "prlmouse"
+    Option         "Device" "/dev/input/mice"
+    Option         "Protocol" "auto"
+EndSection
+
+EOF
+
+    status=$?
+
+    return ${status}
+}
+
+
+
+# Add set 'AllowEmptyInput' section
+# $1 - source file 
+# $2 - target file
+pxcf_add_allowemptyinput () {
+
+    # Check if section 'ServerFlags' exists
+    # If it does not exist add it and exit
+    if ! grep -iqs \
+        '^[[:space:]]*Section[[:space:]]\+"ServerFlags"' "${2}"; then
+        cat >> "${2}" << EOF
+
+Section "ServerFlags"
+    Option         "AllowEmptyInput" "yes"
+    Option         "AutoAddDevices" "yes"
+EndSection
+
+EOF
+        return 0
+    fi
+
+    # First delete AllowEmptyInput/AutoAddDevices entries at all
+    cmd_l='/^[[:space:]]*Option[[:space:]]\+'
+    cmd_r='[[:space:]]\+"\?"\?/d'
+    sed -i "$cmd_l\"AllowEmptyInput\"$cmd_r" "${1}"
+    sed -i "$cmd_l\"AutoAddDevices\"$cmd_r" "${1}"
+
+    # Now add AllowEmptyInput/AutoAddDevices both with yes values
+    # just after the existing Section 'ServerFlags'
+    awk '/^[[:space:]]*Section.*"ServerFlags"/ {
+        print;
+        print "\tOption\t\"AllowEmptyInput\"\t\"yes\"";
+        print "\tOption\t\"AutoAddDevices\"\t\"yes\"";
+        next; } {print} ' \
+        "${1}" > "${2}"
+}
+
+
+# Check that given xorg.conf was patched by Parallels Tools installer.
+# If, for example, given file was regenrated after PT installation there's no
+# need to fix it by this script -- probably we'll just broke it.
+pxcf_check_file_fixable() {
+    # Try to find any of our typical patterns
+    grep -iqs '^[[:space:]]*Driver[[:space:]]\+"prlvideo"' "${1}" && return 0
+    grep -iqs '^[[:space:]]*Identifier[[:space:]]\+"Parallels Monitor"' "${1}" && return 0
+    grep -iqs 'generated by Parallels Guest Tools' "${1}" && return 0
+    # Seems file is not ours
+    return 1
+}
+
+
+# Prints help on usage to stdout
+# $1 - program name
+pxcf_print_help () {
+    echo "Usage: ${1#*/} ACTION file ..."
+    echo "   ACTION:"
+    echo "     check     checks if xorg givven is valid"
+    echo "     fix       fixes given xorg"
+    echo "     help      print this brief help"
+    echo
+}
+
+
+# Prints error message
+# all arguments are message to print
+pxcf_error () {
+    echo "$*" 1>&2
+}
+
+
+# Prints error message
+# all arguments are message to print
+pxcf_warning () {
+    echo "$*" 1>&2
+}
+
+status=${EXIT_OK}
+
+if test $# -lt 1; then
+    pxcf_print_help $0 1>&2
+    echo "ERROR: no action specified" 1>&2
+    exit 1
+fi
+
+# AllowEmpyInput is required only for Xorg versions  >= 1.4
+inputdevices_required=
+allowemptyinput_required=
+if type Xorg > /dev/null 2>&1; then
+    XVERSION=$(Xorg -version 2>&1 | grep -i "x.org x server" | awk '{ print $4 }' | awk -F . '{ printf "%s.%s.%s", $1, $2, $3 }')
+    if [ -z "$XVERSION" ]; then
+        XVERSION=$(Xorg -version 2>&1 | grep -i "x window system version" | awk '{ print $5 }' | awk -F . '{ printf "%s.%s.%s", $1, $2, $3 }')
+        if [ -z "$XVERSION" ]; then
+            XVERSION=$(Xorg -version 2>&1 | grep -i "x protocol version" | awk '{ print $8 }' | awk -F . '{ printf "%s.%s", $1, $2 }')
+        fi
+    fi
+
+	vmajor=$(echo $XVERSION | awk -F . '{ printf "%s", $1 }')
+	vminor=$(echo $XVERSION | awk -F . '{ printf "%s", $2 }')
+	vpatch=$(echo $XVERSION | awk -F . '{ printf "%s", $3 }')
+
+    if [ "$vmajor" -ge "6" ]; then
+    # Must discount major version,
+    # because XOrg changes versioning logic since 7.3 (7.3 -> 1.3)
+        vmajor=$(($vmajor - 6))
+    fi
+
+	v=$(($vmajor*1000000 + $vminor*1000))
+	if [ -n "$vpatch" ]; then
+		v=$(($v + $vpatch))
+	fi
+
+    allowemptyinput_required='no'
+    if [ "$v" -ge "1004000" ]; then
+    # Starting from XServer 1.4 we are must configure udev,
+    # to properly init input devices, in this purposes we will add
+    # AllowEmpyInput/AutoAddDevices option for xserver
+        allowemptyinput_required='yes'
+    fi
+    inputdevices_required='yes'
+    if [ "$v" -ge "1010000" ]; then
+	# For new XServer's releases we drop old style InputDevices configuration entries
+	# and will use udev only
+        inputdevices_required='no'
+    fi
+fi
+
+# Process actions
+case "${1}" in
+    fix)
+        shift
+        for file_to_fix in "$@"; do
+            # Checke if file exists
+            if [ ! -f "${file_to_fix}" ]; then
+                pxcf_warning "File '${file_to_fix}' cannot be found. Skipping."
+                continue
+            elif [ ! -w "${file_to_fix}" ]; then
+                pxcf_warning "File '${file_to_fix}' cannot be altered. Skipping."
+                continue
+            fi
+
+            if ! pxcf_check_file_fixable "${file_to_fix}"; then
+                pxcf_warning "File '${file_to_fix}' doesn't contain " \
+                    "necessary Parallels Tools sections (replaced by somebody?). Skipping."
+                continue
+            fi
+
+            file_to_fix=`readlink -f "${file_to_fix}"`
+            source="${file_to_fix}.pxcf_backup"
+
+            if ! pxcf_check_prl_mouse "${file_to_fix}"; then
+                if  [ "$inputdevices_required" = "yes" ]; then
+                    cp -f "${file_to_fix}" "${source}" 
+                    pxcf_add_prl_mouse "${source}" "${file_to_fix}" || \
+                        exit ${EXIT_ERR_CANNOT_FIX_MOUSE}
+                fi
+            fi
+            
+            if pxcf_check_allowemptyinput_exists_any "${file_to_fix}"; then
+                if  [ "$allowemptyinput_required" != "yes" ]; then
+                    pxcf_del_allowemptyinput "${file_to_fix}" || \
+                        exit ${EXIT_ERR_CANNOT_FIX_ALLOWEMPTYINPUT}
+                fi
+            fi
+            if ! pxcf_check_allowemptyinput_exists_both_yes "${file_to_fix}"; then
+                if [ "$allowemptyinput_required" = "yes" ]; then
+                    cp -f "${file_to_fix}" "${source}" 
+                    pxcf_add_allowemptyinput "${source}" "${file_to_fix}" || \
+                        exit ${EXIT_ERR_CANNOT_FIX_ALLOWEMPTYINPUT}
+                fi
+            fi
+
+            if ! pxcf_check_mouse_sce_yes "${file_to_fix}"; then
+                cp -f "${file_to_fix}" "${source}" 
+                pxcf_add_mouse_sce_yes "${source}" "${file_to_fix}" || \
+                    exit ${EXIT_ERR_CANNOT_FIX_SCE}
+            fi
+
+            if ! pxcf_check_unneeded_cp "${file_to_fix}"; then
+                cp -f "${file_to_fix}" "${source}" 
+                pxcf_del_unneeded_cp "${source}" "${file_to_fix}" || \
+                    exit ${EXIT_ERR_UNNEEDED_CP}
+            fi
+            
+            test -f "${srouce}" && rm -f "${source}"
+        done
+        ;;
+    check)
+        shift
+        for file_to_fix in "$@"; do
+            # Checke if file exists
+            if [ ! -f "${file_to_fix}" ]; then
+                pxcf_warning "File '${file_to_fix}' cannot be found. Skipping."
+                continue
+            fi
+
+            # Run tests
+            if ! pxcf_check_prl_mouse "${file_to_fix}"; then
+                if  [ "$inputdevices_required" = "yes" ]; then
+                    echo "No 'Parallels Mouse' section found in '${file_to_fix}'" 1>&2
+                    status=${EXIT_ERR_MISSING_MOUSE}
+                fi
+            fi
+    
+            if pxcf_check_allowemptyinput_exists_any "${file_to_fix}"; then
+                if [ "$allowemptyinput_required" != "yes" ]; then
+                    echo "Options 'AllowEmptyInput/AutoAddDevices' exists and not required in '${file_to_fix}'" 1>&2
+                    status=${EXIT_ERR_ALLOWEMPTYINPUT_FOUND}
+                fi
+            fi
+            if ! pxcf_check_allowemptyinput_exists_both_yes "${file_to_fix}"; then
+                if [ "$allowemptyinput_required" = "yes" ]; then
+                    echo "Options 'AllowEmptyInput/AutoAddDevices' required in '${file_to_fix}'" 1>&2
+                    status=${EXIT_ERR_MISSING_ALLOWEMPTYINPUT}
+                fi
+            fi
+
+            if ! pxcf_check_mouse_sce_yes "${file_to_fix}"; then
+                echo "'SendCoreEvents' option is not set to positive value in non-parallels mouse section in '${file_to_fix}'" 1>&2
+                status=${EXIT_ERR_MISSING_SCE}
+            fi
+
+            if ! pxcf_check_unneeded_cp "${file_to_fix}"; then
+                echo "non-parallels mouse pointer has 'CorePointer' option in '${file_to_fix}'" 1>&2
+                status=${EXIT_ERR_UNNEEDED_CP}
+            fi
+        done
+        ;;
+    help)
+        pxcf_print_help $0
+        exit 0
+        ;;
+    *)
+        pxcf_print_help $0 1>&2
+        echo "Action '$1' is unknow" 1>&2
+        exit 2
+        ;;
+esac
+
+exit ${status}
+
