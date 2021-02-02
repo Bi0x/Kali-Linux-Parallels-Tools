@@ -3,3 +3,4 @@
 
 - update `/kmods/prl_mod.tar.gz`
 
+- You can just download `Kali-Linux-Parallels-Tools.zip`
